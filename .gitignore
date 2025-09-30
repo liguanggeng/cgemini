@@ -1,0 +1,18 @@
+﻿# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+
+# Local data & secrets
+.env
+
+# Runtime knowledge dump (optional keep track)
+data/knowledge_updates.jsonl
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,469 @@
+﻿"""Top-level orchestrator scaffolding.
+
+This module contains the skeleton code for coordinating Agent1, Agent2, and Agent3.
+The concrete implementations of registries, knowledge services, and agent gateways
+will be introduced in later iterations.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+
+_DEFAULT_MAX_CYCLES = 5
+_DEFAULT_HISTORY_LIMIT = 50
+
+
+class TaskState(str, Enum):
+    """Lifecycle states for a task handled by the orchestrator."""
+
+    PENDING = "pending"
+    CLARIFYING = "clarifying"
+    BUILDING = "building"
+    REVIEWING = "reviewing"
+    DONE = "done"
+    FAILED = "failed"
+
+
+@dataclass
+class ConversationTurn:
+    """Stores one exchange within the task history."""
+
+    role: str
+    content: str
+    metadata: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class FunctionSummary:
+    """Lightweight view of a function that may be reused by Agent1 and Agent2."""
+
+    name: str
+    description: str
+    tags: List[str] = field(default_factory=list)
+
+
+@dataclass
+class LessonCard:
+    """Captures a reusable lesson or reminder for future tasks."""
+
+    lesson_id: str
+    title: str
+    content: str
+
+
+@dataclass
+class Checklist:
+    """Represents a review checklist used by Agent3."""
+
+    name: str
+    items: List[str]
+
+
+@dataclass
+class KnowledgeUpdate:
+    """Structured record describing knowledge changes produced during a task."""
+
+    source: str
+    category: str
+    payload: Dict[str, Any]
+    notes: Optional[Any] = None
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Return a serializable representation suitable for persistence."""
+
+        record = {
+            "source": self.source,
+            "category": self.category,
+            "payload": self.payload,
+        }
+        if self.notes is not None:
+            record["notes"] = self.notes
+        return record
+
+
+@dataclass
+class KnowledgeSnapshot:
+    """Aggregates references that the orchestrator shares with agents."""
+
+    function_index: List[FunctionSummary] = field(default_factory=list)
+    lessons: List[LessonCard] = field(default_factory=list)
+    audit_checklists: List[Checklist] = field(default_factory=list)
+
+
+@dataclass
+class TaskContext:
+    """Holds the mutable state associated with a single task."""
+
+    task_id: str
+    user_request: str
+    task_state: TaskState = TaskState.PENDING
+    history: List[ConversationTurn] = field(default_factory=list)
+    artifacts: Dict[str, Any] = field(default_factory=dict)
+    knowledge_refs: KnowledgeSnapshot = field(default_factory=KnowledgeSnapshot)
+    history_limit: int = _DEFAULT_HISTORY_LIMIT
+
+    def add_history(
+        self,
+        role: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Append a new turn and keep the history within the configured limit."""
+
+        self.history.append(ConversationTurn(role=role, content=content, metadata=metadata))
+        if len(self.history) > self.history_limit:
+            self.history = self.history[-self.history_limit :]
+
+    def set_artifact(self, key: str, value: Any) -> None:
+        """Store or override an artifact produced during orchestration."""
+
+        self.artifacts[key] = value
+
+    def get_artifact(self, key: str, default: Any = None) -> Any:
+        """Return an artifact while providing a default when missing."""
+
+        return self.artifacts.get(key, default)
+
+    def append_knowledge_updates(
+        self,
+        updates: Union[
+            KnowledgeUpdate,
+            Iterable[KnowledgeUpdate],
+            Dict[str, Any],
+            Iterable[Dict[str, Any]],
+        ],
+    ) -> None:
+        """Record knowledge updates using a normalized dataclass container."""
+
+        if not updates:
+            return
+
+        existing = self.artifacts.get("knowledge_updates")
+        store: List[KnowledgeUpdate] = []
+        if existing:
+            if isinstance(existing, list):
+                store.extend(self._coerce_knowledge_update(item) for item in existing if item)
+            else:
+                store.append(self._coerce_knowledge_update(existing))
+
+        if isinstance(updates, KnowledgeUpdate):
+            normalized = [updates]
+        elif isinstance(updates, dict):
+            normalized = [self._coerce_knowledge_update(updates)]
+        elif isinstance(updates, Iterable):
+            normalized = [self._coerce_knowledge_update(item) for item in updates if item]
+        else:
+            normalized = [self._coerce_knowledge_update(updates)]
+
+        store.extend(normalized)
+        self.artifacts["knowledge_updates"] = store
+
+    @staticmethod
+    def _coerce_knowledge_update(item: Any) -> KnowledgeUpdate:
+        """Normalize arbitrary inputs into a KnowledgeUpdate instance."""
+
+        if isinstance(item, KnowledgeUpdate):
+            return item
+        if isinstance(item, dict):
+            source = str(item.get("source", "unknown"))
+            category = str(item.get("category", "misc"))
+            notes = item.get("notes")
+            payload = item.get("payload")
+            if payload is None:
+                payload = {k: v for k, v in item.items() if k not in {"source", "category", "notes"}}
+            elif not isinstance(payload, dict):
+                payload = {"value": payload}
+            return KnowledgeUpdate(source=source, category=category, payload=payload, notes=notes)
+        return KnowledgeUpdate(source="unknown", category="raw", payload={"value": item})
+
+    def mark_state(self, state: TaskState) -> None:
+        """Update the task state stored on the context."""
+
+        self.task_state = state
+
+
+class TopLevelOrchestrator:
+    """Coordinates the work of Agent1, Agent2, and Agent3.
+
+    The orchestrator delegates to injected collaborators for persistence,
+    knowledge management, and agent invocation. Concrete collaborators
+    will be implemented in subsequent iterations.
+    """
+
+    def __init__(
+        self,
+        task_registry,
+        knowledge_service,
+        agent_gateway,
+        feedback_router,
+        *,
+        max_cycles: int = _DEFAULT_MAX_CYCLES,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self._task_registry = task_registry
+        self._knowledge_service = knowledge_service
+        self._agent_gateway = agent_gateway
+        self._feedback_router = feedback_router
+        self._max_cycles = max(1, max_cycles)
+        self._logger = logger or logging.getLogger(__name__)
+
+    def handle_new_task(self, user_request: str) -> TaskContext:
+        """Bootstrap context and drive the agent workflow with safeguards."""
+
+        context = self._bootstrap_context(user_request)
+        ok, _ = self._safe_drive(self._drive_agent1, context, "agent1")
+        if not ok:
+            self._finalize(context)
+            return context
+
+        cycle = 0
+        while context.task_state not in (TaskState.DONE, TaskState.FAILED):
+            if cycle >= self._max_cycles:
+                self._logger.error("Agent loop exceeded max cycles for task %s", context.task_id)
+                context.set_artifact(
+                    "last_error",
+                    {
+                        "stage": "orchestrator",
+                        "error": "cycle_limit_reached",
+                        "cycle_count": cycle,
+                    },
+                )
+                context.mark_state(TaskState.FAILED)
+                self._task_registry.update_state(context.task_id, context.task_state)
+                break
+
+            cycle += 1
+
+            ok, _ = self._safe_drive(self._drive_agent2, context, "agent2")
+            if not ok:
+                break
+
+            ok, review_payload = self._safe_drive(self._drive_agent3, context, "agent3")
+            if not ok:
+                break
+
+            context.set_artifact("agent3_review", review_payload)
+
+            def feedback_step(ctx: TaskContext) -> None:
+                self._apply_feedback(ctx, review_payload)
+
+            ok, _ = self._safe_drive(feedback_step, context, "feedback_router")
+            if not ok:
+                break
+
+        self._finalize(context)
+        return context
+
+    def _bootstrap_context(self, user_request: str) -> TaskContext:
+        """Create a context object and pull a knowledge snapshot."""
+
+        task_id = self._task_registry.register(user_request)
+        snapshot = self._knowledge_service.load_snapshot()
+        context = TaskContext(task_id=task_id, user_request=user_request, knowledge_refs=snapshot)
+        context.mark_state(TaskState.CLARIFYING)
+        self._task_registry.update_state(task_id, context.task_state)
+        context.add_history(
+            role="system",
+            content=f"task_registered:{task_id}",
+            metadata={"user_request": user_request},
+        )
+        return context
+
+    def _drive_agent1(self, context: TaskContext) -> None:
+        """Trigger Agent1 and persist the resulting task brief."""
+
+        payload = {
+            "user_request": context.user_request,
+            "knowledge": context.knowledge_refs,
+        }
+        result = self._agent_gateway.invoke("agent1", payload)
+        context.set_artifact("task_brief", result)
+        context.add_history("agent1", self._summarize_for_history(result), {"artifact": "task_brief"})
+        context.mark_state(TaskState.BUILDING)
+        self._task_registry.update_state(context.task_id, context.task_state)
+
+        if isinstance(result, dict):
+            lessons_to_add = result.get("lessons_to_add")
+            if lessons_to_add:
+                context.append_knowledge_updates(
+                    KnowledgeUpdate(
+                        source="agent1",
+                        category="lessons",
+                        payload={"lessons_to_add": lessons_to_add},
+                    )
+                )
+
+            raw_updates = result.get("knowledge_updates")
+            if raw_updates:
+                context.append_knowledge_updates(
+                    self._wrap_knowledge_payload("agent1", "misc", raw_updates)
+                )
+
+    def _drive_agent2(self, context: TaskContext) -> None:
+        """Trigger Agent2 with the latest brief and knowledge."""
+
+        payload = {
+            "task_brief": context.get_artifact("task_brief"),
+            "knowledge": context.knowledge_refs,
+            "prior_artifacts": context.artifacts,
+        }
+        result = self._agent_gateway.invoke("agent2", payload)
+        context.set_artifact("function_spec", result)
+        context.add_history("agent2", self._summarize_for_history(result), {"artifact": "function_spec"})
+        context.mark_state(TaskState.REVIEWING)
+        self._task_registry.update_state(context.task_id, context.task_state)
+
+        if isinstance(result, dict):
+            updates_payload = result.get("knowledge_updates")
+            if updates_payload:
+                context.append_knowledge_updates(
+                    self._wrap_knowledge_payload("agent2", "function_update", updates_payload)
+                )
+
+    def _drive_agent3(self, context: TaskContext) -> Any:
+        """Trigger Agent3 to review the proposed function specification."""
+
+        payload = {
+            "function_spec": context.get_artifact("function_spec"),
+            "knowledge": context.knowledge_refs,
+        }
+        result = self._agent_gateway.invoke("agent3", payload)
+        context.add_history("agent3", self._summarize_for_history(result))
+        if isinstance(result, dict):
+            updates_payload = result.get("knowledge_updates")
+            if updates_payload:
+                context.append_knowledge_updates(
+                    self._wrap_knowledge_payload("agent3", "review", updates_payload)
+                )
+        return result
+
+    def _apply_feedback(self, context: TaskContext, review_payload: Any) -> None:
+        """Route Agent3 feedback and persist task state transitions."""
+
+        self._feedback_router.route(review_payload, context)
+        self._task_registry.update_state(context.task_id, context.task_state)
+
+    def _finalize(self, context: TaskContext) -> None:
+        """Persist closing state and commit knowledge updates if needed."""
+
+        self._task_registry.update_state(context.task_id, context.task_state)
+        updates = self._collect_knowledge_updates(context)
+        if updates:
+            self._knowledge_service.commit_updates(updates)
+
+    def _safe_drive(
+        self,
+        step: Callable[[TaskContext], Any],
+        context: TaskContext,
+        stage_name: str,
+    ) -> Tuple[bool, Any]:
+        """Execute a pipeline step and capture unexpected failures."""
+
+        try:
+            return True, step(context)
+        except Exception as exc:  # pylint: disable=broad-except
+            self._logger.exception("Stage '%s' failed for task %s", stage_name, context.task_id)
+            context.add_history(
+                role=stage_name,
+                content="error",
+                metadata={
+                    "error": str(exc),
+                    "exception_type": exc.__class__.__name__,
+                },
+            )
+            context.set_artifact(
+                "last_error",
+                {
+                    "stage": stage_name,
+                    "error": str(exc),
+                    "exception_type": exc.__class__.__name__,
+                },
+            )
+            context.mark_state(TaskState.FAILED)
+            self._task_registry.update_state(context.task_id, context.task_state)
+            return False, None
+
+    @staticmethod
+    def _summarize_for_history(payload: Any, *, limit: int = 800) -> str:
+        """Return a compact string representation for history storage."""
+
+        text = str(payload)
+        return text if len(text) <= limit else f"{text[: limit - 3]}..."
+
+    @staticmethod
+    def _wrap_knowledge_payload(source: str, category: str, raw: Any) -> List[KnowledgeUpdate]:
+        """Convert heterogeneous inputs into KnowledgeUpdate instances."""
+
+        if isinstance(raw, list):
+            updates: List[KnowledgeUpdate] = []
+            for item in raw:
+                updates.extend(TopLevelOrchestrator._wrap_knowledge_payload(source, category, item))
+            return updates
+
+        if isinstance(raw, KnowledgeUpdate):
+            return [raw]
+
+        if isinstance(raw, dict):
+            payload = raw.get("payload")
+            if payload is None:
+                payload = {k: v for k, v in raw.items() if k not in {"source", "category", "notes"}}
+            elif not isinstance(payload, dict):
+                payload = {"value": payload}
+            return [
+                KnowledgeUpdate(
+                    source=str(raw.get("source", source)),
+                    category=str(raw.get("category", category)),
+                    payload=payload,
+                    notes=raw.get("notes"),
+                )
+            ]
+
+        return [KnowledgeUpdate(source=source, category=category, payload={"value": raw})]
+
+    @staticmethod
+    def _collect_knowledge_updates(context: TaskContext) -> List[KnowledgeUpdate]:
+        """Gather normalized knowledge updates from the context artifacts."""
+
+        updates_field = context.get_artifact("knowledge_updates")
+        if not updates_field:
+            return []
+
+        items = updates_field if isinstance(updates_field, list) else [updates_field]
+        return [TaskContext._coerce_knowledge_update(item) for item in items if item]
+
+
+class TaskRegistryProtocol:
+    """Expected interface of the task registry used by the orchestrator."""
+
+    def register(self, user_request: str) -> str:  # pragma: no cover - placeholder
+        raise NotImplementedError
+
+    def update_state(self, task_id: str, state: TaskState) -> None:  # pragma: no cover - placeholder
+        raise NotImplementedError
+
+
+class KnowledgeServiceProtocol:
+    """Expected interface of the knowledge service."""
+
+    def load_snapshot(self) -> KnowledgeSnapshot:  # pragma: no cover - placeholder
+        raise NotImplementedError
+
+    def commit_updates(self, updates: Any) -> None:  # pragma: no cover - placeholder
+        raise NotImplementedError
+
+
+class AgentGatewayProtocol:
+    """Expected interface of the agent invocation layer."""
+
+    def invoke(self, agent_name: str, payload: Dict[str, Any]) -> Any:  # pragma: no cover - placeholder
+        raise NotImplementedError
+
+
+class FeedbackRouterProtocol:
+    """Expected interface of the feedback router component."""
+
+    def route(self, review_payload: Any, context: TaskContext) -> None:  # pragma: no cover - placeholder
+        raise NotImplementedError
