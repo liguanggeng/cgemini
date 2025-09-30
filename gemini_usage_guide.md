@@ -858,6 +858,30 @@ print(f"Top-P 范围: {model_info.top_p}")
 print(f"Top-K 范围: {model_info.top_k}")
 ```
 
+
+
+开启搜索
+from google import genai
+from google.genai import types
+
+client = genai.Client()
+
+grounding_tool = types.Tool(
+    google_search=types.GoogleSearch()
+)
+
+config = types.GenerateContentConfig(
+    tools=[grounding_tool]
+)
+
+response = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents="Who won the euro 2024?",
+    config=config,
+)
+
+print(response.text)
+
 ### 模型命名规则
 
 - **gemini-X.X** - 版本号（1.0, 1.5, 2.0）

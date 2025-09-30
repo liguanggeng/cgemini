@@ -43,26 +43,36 @@ class GeminiAgentGateway(AgentGatewayProtocol):
 
     def invoke(self, agent_name: str, payload: Dict[str, Any]) -> Any:
         # Determine prompt and response MIME type based on agent and mode.
+        tools = []
+        response_mime_type = "application/json"  # Default to JSON
+
         if agent_name == "agent1":
             prompt = _build_agent1_prompt(payload)
-            response_mime_type = "application/json"
+            # Enable native Google Search for Agent1 and remove JSON enforcement
+            search_tool = types.Tool(google_search=types.GoogleSearch())
+            tools.append(search_tool)
+            response_mime_type = None  # Let the API decide the response type
+
         elif agent_name == "agent2":
             if payload.get("mode") == "implement":
                 prompt = _build_agent2_impl_prompt(payload)
                 response_mime_type = "text/plain"  # Expecting raw code string
             else:
                 prompt = _build_agent2_prompt(payload)
-                response_mime_type = "application/json"
+
         elif agent_name == "agent3":
             prompt = _build_agent3_prompt(payload)
-            response_mime_type = "application/json"
+
         else:
             raise ValueError(f"Unsupported agent '{agent_name}' for Gemini gateway")
 
         config = types.GenerateContentConfig(
             temperature=self._temperature,
-            response_mime_type=response_mime_type,
+            tools=tools,
         )
+        # Only set mime type if it's not None (i.e., for non-tool-using calls)
+        if response_mime_type:
+            config.response_mime_type = response_mime_type
         if self._system_instruction:
             config.system_instruction = self._system_instruction
 

@@ -25,7 +25,7 @@
 
 ## 项目配置
 --project.toml
---git 地址:git@github.com:liguanggeng/atest.git
+--git 地址:git@github.com:liguanggeng/cgemini.git
 --docker
 
 ## 其他

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import logging
 import time
+import json
+from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
@@ -372,11 +374,71 @@ class TopLevelOrchestrator:
 
     def _finalize(self, context: TaskContext) -> None:
         """Persist closing state and commit knowledge updates if needed."""
-
         self._task_registry.update_state(context.task_id, context.task_state)
+        
+        # Persist the generated function if the task was successful
+        if context.task_state == TaskState.DONE:
+            self._persist_function_artifacts(context)
+
         updates = self._collect_knowledge_updates(context)
         if updates:
             self._knowledge_service.commit_updates(updates)
+
+    def _persist_function_artifacts(self, context: TaskContext) -> None:
+        """Save the function spec and implementation and update the tool registry."""
+        function_spec = context.get_artifact("function_spec")
+        function_impl = context.get_artifact("function_impl")
+
+        if not (isinstance(function_spec, dict) and isinstance(function_impl, str)):
+            self._logger.warning(
+                "Skipping function persistence for task %s due to missing or invalid artifacts.",
+                context.task_id
+            )
+            return
+
+        func_name = function_spec.get("name")
+        if not func_name:
+            self._logger.warning(
+                "Skipping function persistence for task %s because function name is missing.",
+                context.task_id
+            )
+            return
+
+        tools_dir = Path("tools")
+        tools_dir.mkdir(exist_ok=True)
+
+        spec_path = tools_dir / f"{func_name}.json"
+        impl_path = tools_dir / f"{func_name}.py"
+        registry_path = tools_dir / "registry.json"
+
+        # 1. Write the individual artifact files
+        spec_json = json.dumps(function_spec, indent=2, ensure_ascii=False)
+        spec_path.write_text(spec_json, encoding="utf-8")
+        impl_path.write_text(function_impl, encoding="utf-8")
+
+        # 2. Read-modify-write the tool registry
+        registry = {}
+        if registry_path.exists():
+            try:
+                registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                self._logger.warning("Could not parse tool registry, creating a new one.")
+        
+        registry[func_name] = {
+            "description": function_spec.get("description", ""),
+            "version": "1.0", # Basic versioning
+            "status": "active",
+            "declaration_path": str(spec_path),
+            "implementation_path": str(impl_path),
+        }
+
+        registry_json = json.dumps(registry, indent=2, ensure_ascii=False)
+        registry_path.write_text(registry_json, encoding="utf-8")
+
+        context.add_history(
+            role="system",
+            content=f"Function {func_name} persisted and registered in {registry_path}"
+        )
 
     def _safe_drive(
         self,
