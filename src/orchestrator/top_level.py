@@ -8,6 +8,7 @@ will be introduced in later iterations.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
@@ -23,6 +24,7 @@ class TaskState(str, Enum):
     CLARIFYING = "clarifying"
     BUILDING = "building"
     REVIEWING = "reviewing"
+    CODING = "coding"
     DONE = "done"
     FAILED = "failed"
 
@@ -237,6 +239,13 @@ class TopLevelOrchestrator:
 
             cycle += 1
 
+            if context.task_state == TaskState.CODING:
+                ok, _ = self._safe_drive(self._drive_agent2_for_impl, context, "agent2_implement")
+                if ok:
+                    context.mark_state(TaskState.DONE)
+                # The loop will terminate as state is now DONE or FAILED
+                continue
+
             ok, _ = self._safe_drive(self._drive_agent2, context, "agent2")
             if not ok:
                 break
@@ -253,6 +262,9 @@ class TopLevelOrchestrator:
             ok, _ = self._safe_drive(feedback_step, context, "feedback_router")
             if not ok:
                 break
+
+            # Add a delay to avoid hitting API rate limits.
+            time.sleep(30)
 
         self._finalize(context)
         return context
@@ -339,6 +351,18 @@ class TopLevelOrchestrator:
                     self._wrap_knowledge_payload("agent3", "review", updates_payload)
                 )
         return result
+
+    def _drive_agent2_for_impl(self, context: TaskContext) -> None:
+        """Trigger Agent2 in 'implement' mode to generate Python code."""
+        payload = {
+            "mode": "implement",
+            "function_spec": context.get_artifact("function_spec"),
+            "knowledge": context.knowledge_refs,
+        }
+        # The gateway is configured to return plain text for this mode
+        result_code = self._agent_gateway.invoke("agent2", payload)
+        context.set_artifact("function_impl", result_code)
+        context.add_history("agent2", self._summarize_for_history(result_code), {"artifact": "function_impl"})
 
     def _apply_feedback(self, context: TaskContext, review_payload: Any) -> None:
         """Route Agent3 feedback and persist task state transitions."""

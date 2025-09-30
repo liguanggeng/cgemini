@@ -9,6 +9,11 @@ import pathlib
 import sys
 from typing import Tuple
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
+
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -110,7 +115,7 @@ def main() -> None:
     orchestrator, registry, knowledge = build_demo_orchestrator(use_gemini=use_gemini)
 
     if use_gemini:
-        print("[info] Using GeminiAgentGateway — ensure GEMINI_API_KEY 或 Vertex 配置已就绪。")
+        print("[info] Using GeminiAgentGateway - ensure GEMINI_API_KEY or Vertex config is ready.")
 
     user_request = "请把产品描述翻译成英文，并顺便修正拼写错误"
     context = orchestrator.handle_new_task(user_request)

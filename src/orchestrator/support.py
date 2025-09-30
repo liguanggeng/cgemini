@@ -115,7 +115,7 @@ class SimpleFeedbackRouter(FeedbackRouterProtocol):
         context.set_artifact("agent3_feedback", review_payload)
 
         if decision == "approve":
-            context.mark_state(TaskState.DONE)
+            context.mark_state(TaskState.CODING)
             return
 
         if decision == "revise":

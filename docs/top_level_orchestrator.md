@@ -37,61 +37,38 @@
 ```text
 
 TaskContext
-
   - task_id: str
-
   - user_request: str
-
-  - task_state: Enum['pending', 'clarifying', 'building', 'reviewing', 'done', 'failed']
-
+  - task_state: Enum['pending', 'clarifying', 'building', 'reviewing', 'coding', 'done', 'failed']
   - history: list[ConversationTurn]
-
   - artifacts: dict[str, Any]            # 函数描述、验证结果等
-
   - knowledge_refs: KnowledgeSnapshot    # 本轮引用到的知识材料
 
 KnowledgeSnapshot
 
-  - function_index: list[FunctionSummary]
-
-  - lessons: list[LessonCard]
-
-  - audit_checklists: list[Checklist]
-
-```
-
 ## 调度流程示意
 
 ```text
-
 receive_task() ──▶ initialize_context()
-
       │
-
       ▼
-
 run_agent1(context) ──▶ context.artifacts['task_brief']
-
       │
-
       ▼
-
 run_agent2(context) ──▶ context.artifacts['function_spec']
-
       │
-
       ▼
-
 run_agent3(context) ──▶ 审核结果 approve/revise/reject
-
       │
-
-      ├── approve ──▶ finalize_task()
-
       ├── revise  ──▶ 回退到 run_agent2()
-
-      └── reject  ──▶ 标记 failed，回退给 Agent1/人工介入
-
+      ├── reject  ──▶ 标记 failed，回退给 Agent1/人工介入
+      └── approve ──▶ context.state = CODING
+                        │
+                        ▼
+                     run_agent2_for_impl(context) ──▶ context.artifacts['function_impl']
+                        │
+                        ▼
+                     finalize_task()
 ```
 
 ## 调度安全增强（教学版补充）
