@@ -14,6 +14,8 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from google.genai import types
+from src.worker import worker
 
 _DEFAULT_MAX_CYCLES = 5
 _DEFAULT_HISTORY_LIMIT = 50
@@ -190,12 +192,7 @@ class TaskContext:
 
 
 class TopLevelOrchestrator:
-    """Coordinates the work of Agent1, Agent2, and Agent3.
-
-    The orchestrator delegates to injected collaborators for persistence,
-    knowledge management, and agent invocation. Concrete collaborators
-    will be implemented in subsequent iterations.
-    """
+    """Coordinates the work of Agent1, Agent2, and Agent3."""
 
     def __init__(
         self,
@@ -203,6 +200,7 @@ class TopLevelOrchestrator:
         knowledge_service,
         agent_gateway,
         feedback_router,
+        worker,  # New dependency
         *,
         max_cycles: int = _DEFAULT_MAX_CYCLES,
         logger: Optional[logging.Logger] = None,
@@ -211,32 +209,91 @@ class TopLevelOrchestrator:
         self._knowledge_service = knowledge_service
         self._agent_gateway = agent_gateway
         self._feedback_router = feedback_router
+        self._worker = worker  # New attribute
         self._max_cycles = max(1, max_cycles)
         self._logger = logger or logging.getLogger(__name__)
 
     def handle_new_task(self, user_request: str) -> TaskContext:
-        """Bootstrap context and drive the agent workflow with safeguards."""
-
+        """Bootstrap context and process the first turn of the conversation."""
         context = self._bootstrap_context(user_request)
-        ok, _ = self._safe_drive(self._drive_agent1, context, "agent1")
+        return self._process_agent1_turn(context)
+
+    def handle_user_reply(self, context: TaskContext, user_reply: str) -> TaskContext:
+        """Handles a user's reply to a clarifying question from Agent1."""
+        context.add_history("user", user_reply)
+        return self._process_agent1_turn(context)
+
+    def _process_agent1_turn(self, context: TaskContext) -> TaskContext:
+        """Drives a single turn of interaction with Agent1 and routes the result."""
+        # The first drive gets the initial response (could be text, function call, or task brief)
+        ok, agent1_response = self._safe_drive(self._drive_agent1, context, "agent1")
         if not ok:
             self._finalize(context)
             return context
 
+        # The response object itself contains the different possibilities.
+        part = agent1_response.candidates[0].content.parts[0]
+
+        # Case 1: Agent1 returned a FunctionCall request
+        if part.function_call:
+            function_call = part.function_call
+            # Log the model's decision to call a function
+            context.add_history(
+                role="model",
+                content="",  # No text content when a function is called
+                metadata={"function_call": function_call._pb.to_dict() if hasattr(function_call, '_pb') else str(function_call)}
+            )
+
+            # Execute the function using the worker
+            execution_result = self._worker.execute_function(function_call.name, function_call.args)
+
+            # Log the result of the execution
+            context.add_history(
+                role="tool",  # Special role for function responses
+                content="",
+                metadata={"function_response": execution_result}
+            )
+
+            # Second drive: Send the result back to the model to get a final summary
+            final_response = self._agent_gateway.continue_chat_with_function_result(
+                function_name=function_call.name,
+                function_response=execution_result,
+            )
+
+            # Log the final text response from the model
+            context.add_history("model", final_response.text)
+            context.mark_state(TaskState.DONE) # Mark as DONE for this flow
+
+        # Case 2: Agent1 returned a structured task brief for Agent2
+        elif "objective" in agent1_response.text: # Heuristic to check for JSON
+            try:
+                task_brief = json.loads(agent1_response.text)
+                context.set_artifact("task_brief", task_brief)
+                context.add_history("agent1", self._summarize_for_history(task_brief), {"artifact": "task_brief"})
+                context.mark_state(TaskState.BUILDING)
+                # The conversation with Agent1 is over; proceed with the downstream agents.
+                return self._continue_with_downstream_agents(context)
+            except json.JSONDecodeError:
+                # It looked like a task brief, but wasn't valid JSON. Treat as text.
+                context.add_history("model", agent1_response.text)
+                context.mark_state(TaskState.CLARIFYING)
+
+        # Case 3: Agent1 returned a simple text response (chat)
+        else:
+            context.add_history("model", agent1_response.text)
+            context.mark_state(TaskState.CLARIFYING)
+
+        self._finalize(context)
+        return context
+
+    def _continue_with_downstream_agents(self, context: TaskContext) -> TaskContext:
+        """Runs the Agent2 -> Agent3 loop until the task is done or fails."""
         cycle = 0
         while context.task_state not in (TaskState.DONE, TaskState.FAILED):
             if cycle >= self._max_cycles:
                 self._logger.error("Agent loop exceeded max cycles for task %s", context.task_id)
-                context.set_artifact(
-                    "last_error",
-                    {
-                        "stage": "orchestrator",
-                        "error": "cycle_limit_reached",
-                        "cycle_count": cycle,
-                    },
-                )
+                context.set_artifact("last_error", {"error": "cycle_limit_reached"})
                 context.mark_state(TaskState.FAILED)
-                self._task_registry.update_state(context.task_id, context.task_state)
                 break
 
             cycle += 1
@@ -245,7 +302,6 @@ class TopLevelOrchestrator:
                 ok, _ = self._safe_drive(self._drive_agent2_for_impl, context, "agent2_implement")
                 if ok:
                     context.mark_state(TaskState.DONE)
-                # The loop will terminate as state is now DONE or FAILED
                 continue
 
             ok, _ = self._safe_drive(self._drive_agent2, context, "agent2")
@@ -258,22 +314,20 @@ class TopLevelOrchestrator:
 
             context.set_artifact("agent3_review", review_payload)
 
-            def feedback_step(ctx: TaskContext) -> None:
+            def feedback_step(ctx: TaskContext):
                 self._apply_feedback(ctx, review_payload)
 
             ok, _ = self._safe_drive(feedback_step, context, "feedback_router")
             if not ok:
                 break
 
-            # Add a delay to avoid hitting API rate limits.
-            time.sleep(30)
+            time.sleep(1) # Avoid rapid-fire API calls in case of loops
 
         self._finalize(context)
         return context
 
     def _bootstrap_context(self, user_request: str) -> TaskContext:
         """Create a context object and pull a knowledge snapshot."""
-
         task_id = self._task_registry.register(user_request)
         snapshot = self._knowledge_service.load_snapshot()
         context = TaskContext(task_id=task_id, user_request=user_request, knowledge_refs=snapshot)
@@ -284,41 +338,33 @@ class TopLevelOrchestrator:
             content=f"task_registered:{task_id}",
             metadata={"user_request": user_request},
         )
+        # Add the first user message to history
+        context.add_history("user", user_request)
         return context
 
-    def _drive_agent1(self, context: TaskContext) -> None:
-        """Trigger Agent1 and persist the resulting task brief."""
+    def _drive_agent1(self, context: TaskContext) -> Any:
+        """Trigger Agent1 and return the raw result."""
+
+        # The full conversational history for the API
+        api_history = [turn for turn in context.history if turn.role in ["user", "model"]]
+
+        if not api_history or api_history[-1].role != "user":
+            # This can happen if the first turn is not from the user, which shouldn't occur in our flow.
+            raise ValueError("Trying to drive Agent1 without a recent user message.")
+
+        message_to_send = api_history[-1].content
+        history_for_api = api_history[:-1]
 
         payload = {
-            "user_request": context.user_request,
+            "message_to_send": message_to_send,
+            "history": history_for_api,
             "knowledge": context.knowledge_refs,
+            "user_request": context.user_request,  # Pass original request for context in system prompt
         }
-        result = self._agent_gateway.invoke("agent1", payload)
-        context.set_artifact("task_brief", result)
-        context.add_history("agent1", self._summarize_for_history(result), {"artifact": "task_brief"})
-        context.mark_state(TaskState.BUILDING)
-        self._task_registry.update_state(context.task_id, context.task_state)
-
-        if isinstance(result, dict):
-            lessons_to_add = result.get("lessons_to_add")
-            if lessons_to_add:
-                context.append_knowledge_updates(
-                    KnowledgeUpdate(
-                        source="agent1",
-                        category="lessons",
-                        payload={"lessons_to_add": lessons_to_add},
-                    )
-                )
-
-            raw_updates = result.get("knowledge_updates")
-            if raw_updates:
-                context.append_knowledge_updates(
-                    self._wrap_knowledge_payload("agent1", "misc", raw_updates)
-                )
+        return self._agent_gateway.invoke("agent1", payload)
 
     def _drive_agent2(self, context: TaskContext) -> None:
         """Trigger Agent2 with the latest brief and knowledge."""
-
         payload = {
             "task_brief": context.get_artifact("task_brief"),
             "knowledge": context.knowledge_refs,
@@ -329,7 +375,6 @@ class TopLevelOrchestrator:
         context.add_history("agent2", self._summarize_for_history(result), {"artifact": "function_spec"})
         context.mark_state(TaskState.REVIEWING)
         self._task_registry.update_state(context.task_id, context.task_state)
-
         if isinstance(result, dict):
             updates_payload = result.get("knowledge_updates")
             if updates_payload:
@@ -339,7 +384,6 @@ class TopLevelOrchestrator:
 
     def _drive_agent3(self, context: TaskContext) -> Any:
         """Trigger Agent3 to review the proposed function specification."""
-
         payload = {
             "function_spec": context.get_artifact("function_spec"),
             "knowledge": context.knowledge_refs,
@@ -361,25 +405,20 @@ class TopLevelOrchestrator:
             "function_spec": context.get_artifact("function_spec"),
             "knowledge": context.knowledge_refs,
         }
-        # The gateway is configured to return plain text for this mode
         result_code = self._agent_gateway.invoke("agent2", payload)
         context.set_artifact("function_impl", result_code)
         context.add_history("agent2", self._summarize_for_history(result_code), {"artifact": "function_impl"})
 
     def _apply_feedback(self, context: TaskContext, review_payload: Any) -> None:
         """Route Agent3 feedback and persist task state transitions."""
-
         self._feedback_router.route(review_payload, context)
         self._task_registry.update_state(context.task_id, context.task_state)
 
     def _finalize(self, context: TaskContext) -> None:
         """Persist closing state and commit knowledge updates if needed."""
         self._task_registry.update_state(context.task_id, context.task_state)
-        
-        # Persist the generated function if the task was successful
         if context.task_state == TaskState.DONE:
             self._persist_function_artifacts(context)
-
         updates = self._collect_knowledge_updates(context)
         if updates:
             self._knowledge_service.commit_updates(updates)
@@ -388,57 +427,37 @@ class TopLevelOrchestrator:
         """Save the function spec and implementation and update the tool registry."""
         function_spec = context.get_artifact("function_spec")
         function_impl = context.get_artifact("function_impl")
-
         if not (isinstance(function_spec, dict) and isinstance(function_impl, str)):
-            self._logger.warning(
-                "Skipping function persistence for task %s due to missing or invalid artifacts.",
-                context.task_id
-            )
+            self._logger.warning("Skipping function persistence for task %s due to missing artifacts.", context.task_id)
             return
-
         func_name = function_spec.get("name")
         if not func_name:
-            self._logger.warning(
-                "Skipping function persistence for task %s because function name is missing.",
-                context.task_id
-            )
+            self._logger.warning("Skipping function persistence for task %s because function name is missing.", context.task_id)
             return
-
         tools_dir = Path("tools")
         tools_dir.mkdir(exist_ok=True)
-
         spec_path = tools_dir / f"{func_name}.json"
         impl_path = tools_dir / f"{func_name}.py"
         registry_path = tools_dir / "registry.json"
-
-        # 1. Write the individual artifact files
         spec_json = json.dumps(function_spec, indent=2, ensure_ascii=False)
         spec_path.write_text(spec_json, encoding="utf-8")
         impl_path.write_text(function_impl, encoding="utf-8")
-
-        # 2. Read-modify-write the tool registry
         registry = {}
         if registry_path.exists():
             try:
                 registry = json.loads(registry_path.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 self._logger.warning("Could not parse tool registry, creating a new one.")
-        
         registry[func_name] = {
             "description": function_spec.get("description", ""),
-            "version": "1.0", # Basic versioning
+            "version": "1.0",
             "status": "active",
             "declaration_path": str(spec_path),
             "implementation_path": str(impl_path),
         }
-
         registry_json = json.dumps(registry, indent=2, ensure_ascii=False)
         registry_path.write_text(registry_json, encoding="utf-8")
-
-        context.add_history(
-            role="system",
-            content=f"Function {func_name} persisted and registered in {registry_path}"
-        )
+        context.add_history("system", f"Function {func_name} persisted and registered in {registry_path}")
 
     def _safe_drive(
         self,
@@ -447,10 +466,9 @@ class TopLevelOrchestrator:
         stage_name: str,
     ) -> Tuple[bool, Any]:
         """Execute a pipeline step and capture unexpected failures."""
-
         try:
             return True, step(context)
-        except Exception as exc:  # pylint: disable=broad-except
+        except Exception as exc:
             self._logger.exception("Stage '%s' failed for task %s", stage_name, context.task_id)
             context.add_history(
                 role=stage_name,
@@ -460,14 +478,7 @@ class TopLevelOrchestrator:
                     "exception_type": exc.__class__.__name__,
                 },
             )
-            context.set_artifact(
-                "last_error",
-                {
-                    "stage": stage_name,
-                    "error": str(exc),
-                    "exception_type": exc.__class__.__name__,
-                },
-            )
+            context.set_artifact("last_error", {"stage": stage_name, "error": str(exc)})
             context.mark_state(TaskState.FAILED)
             self._task_registry.update_state(context.task_id, context.task_state)
             return False, None
@@ -475,23 +486,19 @@ class TopLevelOrchestrator:
     @staticmethod
     def _summarize_for_history(payload: Any, *, limit: int = 800) -> str:
         """Return a compact string representation for history storage."""
-
         text = str(payload)
         return text if len(text) <= limit else f"{text[: limit - 3]}..."
 
     @staticmethod
     def _wrap_knowledge_payload(source: str, category: str, raw: Any) -> List[KnowledgeUpdate]:
         """Convert heterogeneous inputs into KnowledgeUpdate instances."""
-
         if isinstance(raw, list):
             updates: List[KnowledgeUpdate] = []
             for item in raw:
                 updates.extend(TopLevelOrchestrator._wrap_knowledge_payload(source, category, item))
             return updates
-
         if isinstance(raw, KnowledgeUpdate):
             return [raw]
-
         if isinstance(raw, dict):
             payload = raw.get("payload")
             if payload is None:
@@ -506,17 +513,14 @@ class TopLevelOrchestrator:
                     notes=raw.get("notes"),
                 )
             ]
-
         return [KnowledgeUpdate(source=source, category=category, payload={"value": raw})]
 
     @staticmethod
     def _collect_knowledge_updates(context: TaskContext) -> List[KnowledgeUpdate]:
         """Gather normalized knowledge updates from the context artifacts."""
-
         updates_field = context.get_artifact("knowledge_updates")
         if not updates_field:
             return []
-
         items = updates_field if isinstance(updates_field, list) else [updates_field]
         return [TaskContext._coerce_knowledge_update(item) for item in items if item]
 

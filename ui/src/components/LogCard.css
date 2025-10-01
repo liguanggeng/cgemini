@@ -1,0 +1,43 @@
+.log-card {
+  background-color: #fff;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  margin-bottom: 15px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+.log-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 15px;
+  border-bottom: 1px solid #ddd;
+  background-color: #f9f9f9;
+}
+
+.log-card-header strong {
+  font-size: 0.9em;
+}
+
+.log-card-header span {
+  font-style: italic;
+  color: #555;
+}
+
+.log-card-content {
+  padding: 15px;
+}
+
+.log-card-content pre {
+  background-color: #eee;
+  padding: 10px;
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+/* Type-specific colors */
+.log-card.decision { border-left: 4px solid #3498db; }
+.log-card.function_call { border-left: 4px solid #9b59b6; }
+.log-card.execution { border-left: 4px solid #2ecc71; }
+.log-card.final_response { border-left: 4px solid #f1c40f; }
